@@ -1,16 +1,34 @@
 package main
 
-import "sync"
+import (
+	"encoding/gob"
+	"log"
+	"os"
+	"sync"
+)
 
 // URLStore URLStore类型 是一个结构体
 type URLStore struct {
 	urls map[string]string // 短网址到长网址的映射, key 是 短网址, value 是 长网址
 	mu   sync.RWMutex      // 读写锁
+	file *os.File          // 文件指针, kv键值对的持久化文件
+}
+
+// record 持久化到文件中的kv记录
+type record struct {
+	Key, URL string
 }
 
 // NewURLStore URLStore工厂函数
-func NewURLStore() *URLStore {
-	return &URLStore{urls: make(map[string]string)}
+func NewURLStore(filename string) *URLStore {
+	s := &URLStore{urls: make(map[string]string)}
+	// 追加模式可写打开文件
+	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0664)
+	if err != nil {
+		log.Fatal("URLStore: ", err)
+	}
+	s.file = f
+	return s
 }
 
 // Get 重定向读类型请求的URLStore指针变量的方法
@@ -48,6 +66,12 @@ func (s *URLStore) Put(url string) string {
 	}
 	// shouldn't get here
 	return ""
+}
+
+// save 将给定的 key 和 url 作为一个 gob 编码的 record 写入到磁盘
+func (s *URLStore) save(key, url string) error {
+	e := gob.NewEncoder(s.file) // e为编码器
+	return e.Encode(record{key, url})
 }
 
 /*

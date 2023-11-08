@@ -23,11 +23,14 @@ func main() {
 // Redirect 重定向Http Request处理函数
 func Redirect(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Path[1:]
+	fmt.Println("重定向的 key 为: " + key)
 	url := store.Get(key)
+	fmt.Println(key + "对应的value为: " + url)
 	if url == "" {
 		http.NotFound(w, r)
 		return
 	}
+	// NOTION: 应该保证URL为绝对URL, 以http:// 或https:// 开头
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
