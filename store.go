@@ -2,12 +2,25 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/rpc"
 	"os"
 	"sync"
 )
+
+type Store interface {
+	Put(url, key *string) error
+	Get(key, url *string) error
+}
+
+// ProxyStore RPC代理工厂
+type ProxyStore struct {
+	urls   *URLStore
+	client *rpc.Client
+}
 
 // URLStore URLStore类型 是一个结构体
 type URLStore struct {
@@ -26,56 +39,95 @@ const saveQueueLength = 1000
 
 // NewURLStore URLStore工厂函数
 func NewURLStore(filename string) *URLStore {
-	s := &URLStore{urls: make(map[string]string), save: make(chan record, saveQueueLength)}
+	s := &URLStore{urls: make(map[string]string)}
 
-	// 从磁盘中加载数据到map中
-	if err := s.load(filename); err != nil {
-		log.Println("Error loading URLStore: ", err)
+	if filename != "" {
+		// 从磁盘中加载数据到map中
+		s.save = make(chan record, saveQueueLength)
+		if err := s.load(filename); err != nil {
+			log.Println("Error loading URLStore: ", err)
+		}
+		fmt.Println(s)
+		go s.saveLoop(filename)
 	}
-	fmt.Println(s)
-	go s.saveLoop(filename)
 	return s
 }
 
-// Get 重定向读类型请求的URLStore指针变量的方法
-func (s *URLStore) Get(key string) string {
+// NewProxyStore RPC客户端代理工厂构造函数
+func NewProxyStore(addr string) *ProxyStore {
+	client, err := rpc.DialHTTP("tcp", addr)
+	if err != nil {
+		log.Println("Error constructing ProxyStore:", err)
+	}
+	return &ProxyStore{urls: NewURLStore(""), client: client}
+}
+
+// Get ProxyStore Get方法 传递Get请求给RPC服务端
+func (s *ProxyStore) Get(key, url *string) error {
+	// 先查看从服务器缓存中是否存在数据记录, 如果没有RPC调用去查询主服务器
+	if err := s.urls.Get(key, url); err == nil { // 本地map中找到url
+		return nil
+	}
+	if err := s.client.Call("Store.Get", key, url); err != nil {
+		return err
+	}
+	s.urls.Set(key, url) // 将RPC调用返回的数据写到本地map中
+	return nil
+}
+
+// Put ProxyStore Put方法 传递Put请求给RPC服务端
+func (s *ProxyStore) Put(url, key *string) error {
+	if err := s.client.Call("Store.Put", url, key); err != nil {
+		return err
+	}
+	s.urls.Set(key, url)
+	return nil
+}
+
+// Get URLStore 重定向URL处理器
+func (s *URLStore) Get(key, url *string) error {
 	s.mu.RLock()         // 上读锁
 	defer s.mu.RUnlock() // 函数结束时释放读锁
-	return s.urls[key]   // 返回value string类型
-}
-
-// Set 处理写请求的URLStore指针变量的**方法**
-func (s *URLStore) Set(key, url string) bool {
-	s.mu.Lock()                             // 上写锁
-	defer s.mu.Unlock()                     // 函数结束后释放写锁
-	if _, present := s.urls[key]; present { // 逗号ok模式,
-		return false // key存在, 返回false
+	if u, ok := s.urls[*key]; ok {
+		*url = u
+		return nil
 	}
-	s.urls[key] = url
-	return true
+	return errors.New("key not found")
 }
 
-// Count 计算map中键值对的数量的URLStore指针变量的**方法**
+// Set URLStore 处理写请求的URLStore指针变量的**方法**
+func (s *URLStore) Set(key, url *string) error {
+	s.mu.Lock()                              // 上写锁
+	defer s.mu.Unlock()                      // 函数结束后释放写锁
+	if _, present := s.urls[*key]; present { // 逗号ok模式,
+		return errors.New("key already exists")
+	}
+	s.urls[*key] = *url
+	return nil
+}
+
+// Count URLStore 计算map中键值对的数量的URLStore指针变量的**方法**
 func (s *URLStore) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.urls)
 }
 
-// Put 将长网址映射到短网址并set到map的URLStore指针变量的方法
-func (s *URLStore) Put(url string) string {
+// Put URLStore 长URL转短URL处理器
+func (s *URLStore) Put(url, key *string) error {
 	for { // for死循环一直尝试keygen
-		key := genKey(s.Count()) // generate the short URL
-		if ok := s.Set(key, url); ok {
-			// 先做持久化(将key-value放到channel通道中), 再返回key
-			s.save <- record{key, url}
-			return key
+		*key = genKey(s.Count()) // generate the short URL
+		if err := s.Set(key, url); err == nil {
+			break
 		}
 	}
-	panic("shouldn't get here")
+	if s.save != nil {
+		s.save <- record{*key, *url}
+	}
+	return nil
 }
 
-// saveLoop 将给定的 key 和 url 作为一个 gob 编码的 record 写入到磁盘
+// saveLoop URLStore 将给定的 key 和 url 作为一个 gob 编码的 record 写入到磁盘
 func (s *URLStore) saveLoop(filename string) {
 	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
 	if err != nil {
@@ -91,7 +143,7 @@ func (s *URLStore) saveLoop(filename string) {
 	}
 }
 
-// load 在程序启动后, 需要将磁盘上的数据读到URLStore中
+// load URLStore 在程序启动后, 需要将磁盘上的数据读到URLStore中
 func (s *URLStore) load(filename string) error {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -103,7 +155,7 @@ func (s *URLStore) load(filename string) error {
 	for err == nil {
 		var r record
 		if err = d.Decode(&r); err == nil {
-			s.Set(r.Key, r.URL)
+			s.Set(&r.Key, &r.URL)
 		}
 	}
 	if err == io.EOF {
