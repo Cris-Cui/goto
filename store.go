@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -12,7 +13,7 @@ import (
 type URLStore struct {
 	urls map[string]string // 短网址到长网址的映射, key 是 短网址, value 是 长网址
 	mu   sync.RWMutex      // 读写锁
-	file *os.File          // 文件指针, kv键值对的持久化文件
+	save chan record       // record 类型channel
 }
 
 // record 持久化到文件中的kv记录
@@ -20,19 +21,19 @@ type record struct {
 	Key, URL string
 }
 
+// save channel 缓冲区大小
+const saveQueueLength = 1000
+
 // NewURLStore URLStore工厂函数
 func NewURLStore(filename string) *URLStore {
-	s := &URLStore{urls: make(map[string]string)}
-	// 追加模式可写打开文件
-	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0664)
-	if err != nil {
-		log.Fatal("URLStore: ", err)
-	}
-	s.file = f
+	s := &URLStore{urls: make(map[string]string), save: make(chan record, saveQueueLength)}
+
 	// 从磁盘中加载数据到map中
-	if err := s.load(); err != nil {
-		log.Println("Error loading data in URLStore: ", err)
+	if err := s.load(filename); err != nil {
+		log.Println("Error loading URLStore: ", err)
 	}
+	fmt.Println(s)
+	go s.saveLoop(filename)
 	return s
 }
 
@@ -66,30 +67,39 @@ func (s *URLStore) Put(url string) string {
 	for { // for死循环一直尝试keygen
 		key := genKey(s.Count()) // generate the short URL
 		if ok := s.Set(key, url); ok {
-			// 先做持久化, 再返回key
-			if err := s.save(key, url); err != nil {
-				log.Println("Error saving to URLStore: ", err)
-			}
+			// 先做持久化(将key-value放到channel通道中), 再返回key
+			s.save <- record{key, url}
 			return key
 		}
 	}
-	// shouldn't get here
 	panic("shouldn't get here")
 }
 
-// save 将给定的 key 和 url 作为一个 gob 编码的 record 写入到磁盘
-func (s *URLStore) save(key, url string) error {
-	e := gob.NewEncoder(s.file) // e为编码器
-	return e.Encode(record{key, url})
+// saveLoop 将给定的 key 和 url 作为一个 gob 编码的 record 写入到磁盘
+func (s *URLStore) saveLoop(filename string) {
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
+	if err != nil {
+		log.Fatal("URLStore: ", err)
+	}
+	defer f.Close()
+	e := gob.NewEncoder(f)
+	for {
+		r := <-s.save
+		if err := e.Encode(r); err != nil {
+			log.Println("URLStore: ", err)
+		}
+	}
 }
 
 // load 在程序启动后, 需要将磁盘上的数据读到URLStore中
-func (s *URLStore) load() error {
-	if _, err := s.file.Seek(0, 0); err != nil {
+func (s *URLStore) load(filename string) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		log.Println("Error opening URLStore: ", err)
 		return err
 	}
-	d := gob.NewDecoder(s.file) // 解码器
-	var err error               // 声明error类型变量
+	defer f.Close()
+	d := gob.NewDecoder(f) // 解码器
 	for err == nil {
 		var r record
 		if err = d.Decode(&r); err == nil {
@@ -99,6 +109,8 @@ func (s *URLStore) load() error {
 	if err == io.EOF {
 		return nil
 	}
+	// error occurred
+	log.Println("Error decoding URLStore: ", err)
 	return err
 }
 
