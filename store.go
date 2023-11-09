@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -82,7 +82,7 @@ func (s *URLStore) saveLoop(filename string) {
 		log.Fatal("URLStore: ", err)
 	}
 	defer f.Close()
-	e := gob.NewEncoder(f)
+	e := json.NewEncoder(f)
 	for {
 		r := <-s.save
 		if err := e.Encode(r); err != nil {
@@ -99,7 +99,7 @@ func (s *URLStore) load(filename string) error {
 		return err
 	}
 	defer f.Close()
-	d := gob.NewDecoder(f) // 解码器
+	d := json.NewDecoder(f) // 解码器
 	for err == nil {
 		var r record
 		if err = d.Decode(&r); err == nil {
